@@ -276,6 +276,10 @@ def classify_error(e):
         return 'already'
     if 'privacy' in r or 'notmutual' in r or 'not_mutual' in r:
         return 'privacy'
+    if 'userchannelstoomuch' in r or 'already in too many' in r:
+        return 'user_busy'            # این کاربر عضو کانال‌های زیادیه؛ فقط خودش رد می‌شه
+    if 'userstoomuch' in r or 'maximum number of users' in r or 'users_too_much' in r:
+        return 'limit'                # کانال مقصد پر شده/به سقف افزودن رسیده؛ کل کار باید متوقف بشه
     if 'floodwait' in r or 'peerflood' in r or 'too_many' in r or 'toomany' in r or '429' in r or 'flood' in r:
         return 'flood'
     if 'adminrequired' in r or 'admin_required' in r or 'writeforbidden' in r or 'chatadmin' in r:
@@ -389,7 +393,15 @@ async def add_one(client, dest_inp, username):
 
 LABELS = {'added': '✅ اضافه شد', 'already': '↩️ از قبل عضو بود', 'privacy': '🔒 اجازه‌ی افزودن نداده',
           'not_found': '❓ پیدا نشد', 'banned': '🚫 از کانال محروم', 'error': '⚠️ خطای دیگه',
-          'server': '🛠 خطای سرور سروش‌پلاس', 'flood': '⏳ محدودیت سرعت', 'noadmin': '🔑 دسترسی ادمین کافی نیست'}
+          'server': '🛠 خطای سرور سروش‌پلاس', 'flood': '⏳ محدودیت سرعت', 'noadmin': '🔑 دسترسی ادمین کافی نیست',
+          'user_busy': '📚 عضو کانال‌های زیادیه', 'limit': '🧱 سقف افزودن کانال مقصد پر شده'}
+
+STOP_REASONS = {
+    'flood': 'محدودیت سرعت سروش‌پلاس — بعداً (چند ساعت دیگه) دوباره امتحان کن',
+    'noadmin': 'اکانت باید ادمین کانال مقصد با اجازه‌ی افزودن عضو باشه',
+    'limit': 'سروش‌پلاس می‌گه تعداد کاربرها به سقف رسیده («maximum number of users exceeded»). یعنی کانال مقصد '
+             'دیگه افزودن دستی قبول نمی‌کنه. بقیه رو با لینک دعوت کانال برای خودشون بفرست یا بعداً دوباره امتحان کن.',
+}
 
 
 def run_add_job(dest_name, users):
@@ -403,7 +415,7 @@ def run_add_job(dest_name, users):
         notify(f'🚀 شروع شد: {len(batch)} نفر → {ref_label(dest_name)}\n'
                f'⏱ سرعت خودکار: از {ADD_DELAY_MIN:g} ثانیه فاصله شروع می‌شه و با محدودیت سروش‌پلاس '
                f'کند می‌شه (تا {ADD_DELAY_MAX:g} ثانیه). برای توقف: /stop')
-        cur, clean, last_hits = ADD_DELAY_MIN, 0, S['flood_hits']
+        cur, clean, last_hits, hard_fail = ADD_DELAY_MIN, 0, S['flood_hits'], 0
         for i, un in enumerate(batch, 1):
             if S['stop']:
                 stopped_reason = 'توسط ادمین متوقف شد'
@@ -413,11 +425,16 @@ def run_add_job(dest_name, users):
             results[un] = (code, info)
             if code not in ('added', 'already'):
                 notify(f'❌ @{un} — {LABELS.get(code, code)}\n{info[:900]}')
-            if code in ('flood', 'noadmin'):
-                stopped_reason = LABELS[code] + (' — بعداً دوباره امتحان کن' if code == 'flood'
-                                                  else ' — اکانت باید ادمین کانال با اجازه‌ی افزودن عضو باشه')
+            if code in STOP_REASONS:
+                stopped_reason = LABELS[code] + ' — ' + STOP_REASONS[code]
                 rest = batch[i - 1:] + rest
                 results.pop(un, None)
+                break
+            # قطع‌کننده‌ی مدار: چند خطای پشت‌سرهم از نوع نامعلوم/سرور یعنی مشکل از کاربر نیست؛ ادامه ندیم
+            hard_fail = hard_fail + 1 if code in ('error', 'server') else 0
+            if hard_fail >= 5:
+                stopped_reason = '۵ خطای پشت‌سرهم از سمت سرور/نامعلوم — برای جلوگیری از فشار الکی به اکانت متوقف شد'
+                rest = batch[i:] + rest
                 break
             if S['flood_hits'] != last_hits:       # سروش‌پلاس گفت «صبر کن»: کندتر شو
                 last_hits, clean = S['flood_hits'], 0
@@ -449,7 +466,7 @@ def deliver_report(dest_name, results, rest, stopped_reason):
     lines = [f'📋 گزارش افزودن به {dest_name}']
     if stopped_reason:
         lines.append(f'⛔ متوقف شد: {stopped_reason}')
-    for code in ('added', 'already', 'privacy', 'not_found', 'banned', 'server', 'error'):
+    for code in ('added', 'already', 'privacy', 'not_found', 'user_busy', 'banned', 'server', 'error'):
         if counts.get(code):
             lines.append(f'{LABELS[code]}: {counts[code]:,}')
     if counts.get('server') or counts.get('error'):
@@ -461,7 +478,7 @@ def deliver_report(dest_name, results, rest, stopped_reason):
     send_message(ADMIN_ID, '\n'.join(lines))
 
     detail = []
-    for code in ('privacy', 'not_found', 'banned', 'server', 'error'):
+    for code in ('privacy', 'not_found', 'user_busy', 'banned', 'server', 'error'):
         items = [(u, info) for u, (c, info) in results.items() if c == code]
         if items:
             detail.append(f'--- {LABELS[code]} ({len(items)}) ---')
