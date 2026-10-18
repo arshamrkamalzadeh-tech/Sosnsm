@@ -14,7 +14,8 @@
 
 env ها (همه اختیاری):
   BOT_TOKEN     : توکن بات
-  ADMIN_ID      : آیدی عددی ادمین
+  ADMIN_ID      : آیدی عددی مالک بات (فقط برای /stats). بات برای همه بازه و هر کاربر اکانت خودش رو وصل می‌کنه
+  MAX_USERS     : حداکثر اکانت وصل‌شده هم‌زمان (پیش‌فرض 0 = بدون محدودیت)
   ADD_LIMIT     : حداکثر افزودن در هر بار اجرا (پیش‌فرض 1000)
   ADD_DELAY_MIN : فاصله‌ی شروع بین هر افزودن، ثانیه (پیش‌فرض 0.5)
   ADD_DELAY_MAX : سقف فاصله هنگام کند شدن، ثانیه (پیش‌فرض 20)
@@ -63,6 +64,7 @@ def _float_env(name, default):
 
 
 ADD_LIMIT = max(1, _int_env("ADD_LIMIT", 1000))
+MAX_USERS = max(0, _int_env("MAX_USERS", 0))
 # فاصله‌ی شروع بین هر افزودن (ثانیه). سرعت خودکار تنظیم می‌شه: با هر «صبر کن» سروش‌پلاس دو برابر،
 # و بعد از چند افزودنِ بی‌مشکل دوباره کمتر می‌شه. ADD_DELAY_MAX سقف فاصله‌ست.
 ADD_DELAY_MIN = max(0.0, _float_env("ADD_DELAY_MIN", 0.5))
@@ -70,8 +72,9 @@ ADD_DELAY_MAX = max(ADD_DELAY_MIN, _float_env("ADD_DELAY_MAX", 20))
 DEEP_SEARCH = os.getenv("DEEP_SEARCH", "1").strip() != "0"
 INCLUDE_BOTS = os.getenv("INCLUDE_BOTS", "0").strip() == "1"
 
-SESSION_NAME = "adder_session"
-CONFIG_PATH = "adder_config.json"
+DATA_DIR = "data"                 # data/<user_id>/session* و data/<user_id>/config.json
+OLD_SESSION_NAME = "adder_session"    # فایل‌های نسخه‌ی تک‌کاربره (یه بار به ADMIN_ID منتقل می‌شن)
+OLD_CONFIG_PATH = "adder_config.json"
 CODE_TIMEOUT = 300
 CHUNK_LIMIT = 3500
 MAX_FILE_BYTES = 5 * 1024 * 1024
@@ -94,19 +97,70 @@ try:
 except Exception:  # pragma: no cover
     tl_functions, tl_types = None, None
 
-S = {'gen': 0, 'running': False, 'starting': False, 'waiting': None, 'phone': None,
-     'account': None, 'client': None, 'loop': None, 'state': None, 'busy': False,
-     'stop': False, 'users': [], 'dest': None, 'flood_hits': 0, 'mode': None, 'picks': []}
-ANSWERS = queue.Queue()
+# هر کاربر یه کانتکست جدا داره (اکانت، لیست، مقصد، سشن، ...). S بر اساس ترد جاری، کانتکستِ همون کاربر رو برمی‌گردونه.
+_tl = threading.local()
+CTXS = {}
+CTX_LOCK = threading.Lock()
+LOGIN_LOCK = threading.Lock()     # لاگین‌ها یکی‌یکی انجام می‌شن تا کد تأیید به کاربر اشتباه نره
+LOGIN_UID = None
 
-# لاگ هشدار/خطای کتابخونه (مثل RPC error ها) تو حافظه نگه داشته می‌شه تا آخر کار به‌صورت debug.txt برسه
-LOG_BUF = deque(maxlen=400)
+
+def _new_ctx(uid):
+    return {'uid': uid, 'gen': 0, 'running': False, 'starting': False, 'waiting': None, 'phone': None,
+            'account': None, 'client': None, 'loop': None, 'state': None, 'busy': False,
+            'stop': False, 'users': [], 'dest': None, 'flood_hits': 0, 'mode': None, 'picks': [],
+            'target': None, 'answers': queue.Queue(), 'log': deque(maxlen=400)}
 
 
+def bind(uid):
+    """ترد جاری رو به کاربر uid وصل می‌کنه (و کانتکستش رو در صورت نبود می‌سازه)."""
+    with CTX_LOCK:
+        if uid not in CTXS:
+            CTXS[uid] = _new_ctx(uid)
+    _tl.uid = uid
+
+
+def UID():
+    return getattr(_tl, 'uid', None)
+
+
+class _SProxy:
+    def _d(self):
+        return CTXS[_tl.uid]
+
+    def __getitem__(self, k):
+        return self._d()[k]
+
+    def __setitem__(self, k, v):
+        self._d()[k] = v
+
+    def update(self, *a, **kw):
+        self._d().update(*a, **kw)
+
+    def get(self, k, default=None):
+        return self._d().get(k, default)
+
+
+S = _SProxy()
+
+
+def spawn(fn, *args):
+    """fn رو تو ترد جدا برای همین کاربر اجرا می‌کنه."""
+    uid = UID()
+
+    def _run():
+        bind(uid)
+        fn(*args)
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# لاگ هشدار/خطای کتابخونه (مثل RPC error ها) برای هر کاربر جدا تو حافظه نگه داشته می‌شه تا آخر کار به‌صورت debug.txt برسه
 class _BufHandler(logging.Handler):
     def emit(self, record):
         try:
-            LOG_BUF.append(f'{time.strftime("%H:%M:%S")} {record.name}: {record.getMessage()}')
+            u = getattr(_tl, 'uid', None)
+            if u in CTXS:
+                CTXS[u]['log'].append(f'{time.strftime("%H:%M:%S")} {record.name}: {record.getMessage()}')
         except Exception:
             pass
 
@@ -165,7 +219,7 @@ def get_updates(offset=None):
 
 
 def notify(text, reply_markup=None):
-    send_message(ADMIN_ID, text, reply_markup)
+    send_message(UID(), text, reply_markup)
 
 
 CONTACT_KB = {'keyboard': [[{'text': '📱 ارسال شماره‌ی من', 'request_contact': True}]],
@@ -404,25 +458,33 @@ STOP_REASONS = {
 }
 
 
-def run_add_job(dest_name, users):
-    """تو ترد جدا اجرا می‌شه. اولین ADD_LIMIT نفر اضافه می‌شن؛ بقیه برای بار بعد برمی‌گردن."""
+def run_add_job(dest_name, users, target=None):
+    """تو ترد جدا اجرا می‌شه. اونقدر از لیست جلو می‌ره تا `target` نفر واقعاً اضافه بشن
+    (کسایی که افزودن رو بسته باشن/پیدا نشن حساب نمی‌شن). بقیه‌ی لیست برای بار بعد برمی‌گرده."""
     results, stopped_reason = {}, None
-    batch, rest = users[:ADD_LIMIT], users[ADD_LIMIT:]
+    target = max(1, min(target or ADD_LIMIT, ADD_LIMIT))
+    batch, rest, added = users, [], 0
     try:
         S['busy'], S['stop'] = True, False
         loop = S['loop']
         dest_inp = asyncio.run_coroutine_threadsafe(resolve_dest(S['client'], dest_name), loop).result(timeout=60)
-        notify(f'🚀 شروع شد: {len(batch)} نفر → {ref_label(dest_name)}\n'
+        notify(f'🚀 شروع شد: هدف {target:,} نفرِ واقعاً اضافه‌شده → {ref_label(dest_name)}\n'
+               f'📋 از بین {len(batch):,} یوزرنیم؛ کسایی که افزودن رو بسته باشن رد می‌شن و حساب نمی‌شن.\n'
                f'⏱ سرعت خودکار: از {ADD_DELAY_MIN:g} ثانیه فاصله شروع می‌شه و با محدودیت سروش‌پلاس '
                f'کند می‌شه (تا {ADD_DELAY_MAX:g} ثانیه). برای توقف: /stop')
         cur, clean, last_hits, hard_fail = ADD_DELAY_MIN, 0, S['flood_hits'], 0
         for i, un in enumerate(batch, 1):
+            if added >= target:
+                rest = batch[i - 1:]
+                break
             if S['stop']:
                 stopped_reason = 'توسط ادمین متوقف شد'
                 rest = batch[i - 1:] + rest
                 break
             code, info = asyncio.run_coroutine_threadsafe(add_one(S['client'], dest_inp, un), loop).result(timeout=120)
             results[un] = (code, info)
+            if code == 'added':
+                added += 1
             if code not in ('added', 'already'):
                 notify(f'❌ @{un} — {LABELS.get(code, code)}\n{info[:900]}')
             if code in STOP_REASONS:
@@ -444,11 +506,12 @@ def run_add_job(dest_name, users):
                 if clean >= 8:                      # چند بار بی‌مشکل: کمی تندتر شو
                     clean, cur = 0, max(ADD_DELAY_MIN, cur * 0.7)
             if i % 10 == 0:
-                ok = sum(1 for c, _ in results.values() if c == 'added')
-                notify(f'📊 {i}/{len(batch)} بررسی شد؛ {ok} نفر اضافه شد. (فاصله‌ی فعلی ≈ {cur:.1f} ثانیه)')
-            if i < len(batch) and code == 'added':
+                notify(f'📊 {i}/{len(batch)} بررسی شد؛ {added}/{target} نفر اضافه شد. (فاصله‌ی فعلی ≈ {cur:.1f} ثانیه)')
+            if i < len(batch) and code == 'added' and added < target:
                 # فقط بعد از افزودنِ موفق صبر می‌کنیم؛ نفراتی که اضافه نشدن (خطا/حریم خصوصی) نیازی به فاصله ندارن
                 time.sleep(random.uniform(cur * 0.8, cur * 1.2) if cur > 0 else 0)
+        if not stopped_reason and added < target:
+            stopped_reason = f'لیست یوزرنیم‌ها تموم شد و فقط {added:,} از {target:,} نفر اضافه شد'
     except Exception as e:
         print('[adder] job error:', repr(e))
         stopped_reason = f'خطا: {e!r}'
@@ -475,7 +538,7 @@ def deliver_report(dest_name, results, rest, stopped_reason):
             lines.append(f'ℹ️ نمونه‌ی خطا: {first.splitlines()[0][:200]}')
     if rest:
         lines.append(f'⏭ باقی‌مونده برای بار بعد: {len(rest):,}')
-    send_message(ADMIN_ID, '\n'.join(lines))
+    send_message(UID(), '\n'.join(lines))
 
     detail = []
     for code in ('privacy', 'not_found', 'user_busy', 'banned', 'server', 'error'):
@@ -487,21 +550,21 @@ def deliver_report(dest_name, results, rest, stopped_reason):
                 if info:
                     detail.append('    ' + info.strip().replace('\n', '\n    '))
     if detail:
-        send_document(ADMIN_ID, 'failed.txt', '\n'.join(detail).encode('utf-8'), caption='نفرات اضافه‌نشده')
-    if LOG_BUF and (detail or stopped_reason):
-        send_document(ADMIN_ID, 'debug.txt', '\n'.join(LOG_BUF).encode('utf-8'),
+        send_document(UID(), 'failed.txt', '\n'.join(detail).encode('utf-8'), caption='نفرات اضافه‌نشده')
+    if S['log'] and (detail or stopped_reason):
+        send_document(UID(), 'debug.txt', '\n'.join(S['log']).encode('utf-8'),
                       caption='لاگ خطاها/هشدارهای کتابخونه (برای رفع باگ)')
     if rest:
         body = ['@' + u for u in rest]
         for part in chunk_lines(body):
-            send_message(ADMIN_ID, part)
+            send_message(UID(), part)
             time.sleep(0.4)
-        send_document(ADMIN_ID, 'remaining.txt', '\n'.join(body).encode('utf-8'),
+        send_document(UID(), 'remaining.txt', '\n'.join(body).encode('utf-8'),
                       caption='باقی‌مونده؛ برای ادامه همین لیست رو دوباره بفرست')
     S['users'] = list(rest)                       # باقی‌مونده‌ها برای بار بعد آماده می‌مونن
     S['state'] = 'users' if S['running'] else None
     if rest:
-        send_message(ADMIN_ID, f'🔁 {len(rest):,} نفر باقی‌مونده آماده‌ست؛ هر وقت خواستی دوباره لینک مقصد رو بفرست.')
+        send_message(UID(), f'🔁 {len(rest):,} نفر باقی‌مونده آماده‌ست؛ هر وقت خواستی دوباره لینک مقصد رو بفرست.')
 
 
 BTN_EXTRACT = '📥 استخراج یوزرنیم‌ها'
@@ -671,7 +734,7 @@ def run_extract_job(name):
             fetch_members(S['client'], name, progress=notify), S['loop'])
         found, total = fut.result(timeout=1800)
         usernames, st = build_report(found, total)
-        deliver(ADMIN_ID, label, usernames, st)
+        deliver(UID(), label, usernames, st)
         S['users'] = [u[1:] for u in usernames]       # برای «افزودن اعضا» آماده بمونه
         notify(f'✅ {len(usernames):,} یوزرنیم برای افزودن آماده شد (دکمه‌ی «{BTN_ADD}»).\n'
                '🔗 اگه کانال دیگه‌ای می‌خوای بخونی، لینکش رو بفرست.')
@@ -684,9 +747,17 @@ def run_extract_job(name):
 
 
 # ----------------------------- لاگین اکانت (userbot) -----------------------------
+def _login_bind():
+    """ترد جاری (یا ترد کمکیِ کتابخونه) رو به کاربرِ در حال لاگین وصل می‌کنه."""
+    if UID() is None and LOGIN_UID is not None:
+        bind(LOGIN_UID)
+
+
 def ask_admin(kind):
-    while not ANSWERS.empty():
-        ANSWERS.get_nowait()
+    _login_bind()
+    q = S['answers']
+    while not q.empty():
+        q.get_nowait()
     S['waiting'] = kind
     if kind == 'code':
         notify('📩 کد تأیید به سروش پلاسِ اکانتت ارسال شد.\n'
@@ -695,7 +766,7 @@ def ask_admin(kind):
     else:
         notify('🔐 اکانتت رمز دومرحله‌ای داره. رمزت رو بفرست:')
     try:
-        ans = ANSWERS.get(timeout=CODE_TIMEOUT)
+        ans = q.get(timeout=CODE_TIMEOUT)
     except queue.Empty:
         S['waiting'] = None
         raise TimeoutError('از ادمین جوابی نیومد')
@@ -704,6 +775,7 @@ def ask_admin(kind):
 
 
 def _fake_input(prompt=''):
+    _login_bind()
     p = str(prompt).lower()
     if any(k in p for k in ('phone', 'mobile', 'number', 'شماره')):
         return S['phone'] or ''
@@ -717,36 +789,74 @@ if SPLUS_OK:
     getpass.getpass = lambda prompt='', stream=None: _fake_input(prompt)
 
 
+def user_dir(uid=None):
+    d = os.path.join(DATA_DIR, str(uid if uid is not None else UID()))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def session_base():
+    return os.path.join(user_dir(), 'session')
+
+
+def cfg_path():
+    return os.path.join(user_dir(), 'config.json')
+
+
 def cfg_load():
     try:
-        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+        with open(cfg_path(), 'r', encoding='utf-8') as f:
             return json.load(f)
     except Exception:
         return {}
 
 
 def cfg_save(cfg):
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+    with open(cfg_path(), 'w', encoding='utf-8') as f:
         json.dump(cfg, f, ensure_ascii=False)
 
 
 def session_files():
-    return [f for f in glob.glob(SESSION_NAME + '*')
+    return [f for f in glob.glob(session_base() + '*')
             if not f.endswith(('-journal', '-wal', '-shm')) and os.path.isfile(f)]
+
+
+def connected_count():
+    return sum(1 for c in list(CTXS.values()) if c['running'] or c['starting'])
+
+
+def migrate_old_files():
+    """نسخه‌ی تک‌کاربره: سشن/کانفیگ قدیمی رو به پوشه‌ی ADMIN_ID منتقل می‌کنه."""
+    if not ADMIN_ID or os.path.isdir(os.path.join(DATA_DIR, str(ADMIN_ID))):
+        return
+    old = [f for f in glob.glob(OLD_SESSION_NAME + '*') if os.path.isfile(f)]
+    if not old and not os.path.isfile(OLD_CONFIG_PATH):
+        return
+    d = user_dir(ADMIN_ID)
+    for f in old:
+        os.replace(f, os.path.join(d, 'session' + f[len(OLD_SESSION_NAME):]))
+    if os.path.isfile(OLD_CONFIG_PATH):
+        os.replace(OLD_CONFIG_PATH, os.path.join(d, 'config.json'))
 
 
 async def _userbot_main(phone, gen):
     S['loop'] = asyncio.get_running_loop()
-    client = spluspy.Client(SESSION_NAME)
+    client = spluspy.Client(session_base())
     kwargs = {'phone': phone}
     try:
         if 'code_callback' in inspect.signature(client.start).parameters:
             kwargs['code_callback'] = lambda: ask_admin('code')
     except (TypeError, ValueError):
         pass
-    res = client.start(**kwargs)
-    if inspect.isawaitable(res):
-        await res
+    global LOGIN_UID
+    with LOGIN_LOCK:
+        LOGIN_UID = UID()
+        try:
+            res = client.start(**kwargs)
+            if inspect.isawaitable(res):
+                await res
+        finally:
+            LOGIN_UID = None
 
     cfg_save({'phone': phone})
     try:
@@ -761,7 +871,7 @@ async def _userbot_main(phone, gen):
     if S['gen'] != gen:
         return
     S.update(running=True, starting=False, client=client, state='menu', mode=None)
-    send_message(ADMIN_ID, '✅ لاگین انجام شد.\nیکی از گزینه‌ها رو انتخاب کن:', MENU_KB)
+    send_message(UID(), '✅ لاگین انجام شد.\nیکی از گزینه‌ها رو انتخاب کن:', MENU_KB)
     while S['gen'] == gen:
         await asyncio.sleep(1)
     res = client.disconnect()
@@ -769,7 +879,8 @@ async def _userbot_main(phone, gen):
         await res
 
 
-def _userbot_thread(phone, gen):
+def _userbot_thread(uid, phone, gen):
+    bind(uid)
     try:
         asyncio.run(_userbot_main(phone, gen))
     except Exception as e:
@@ -782,7 +893,7 @@ def _userbot_thread(phone, gen):
 def start_userbot(phone):
     S['gen'] += 1
     S.update(phone=phone, starting=True, running=False, client=None)
-    threading.Thread(target=_userbot_thread, args=(phone, S['gen']), daemon=True).start()
+    threading.Thread(target=_userbot_thread, args=(UID(), phone, S['gen']), daemon=True).start()
 
 
 def logout():
@@ -795,7 +906,7 @@ def logout():
         except OSError:
             pass
     try:
-        os.remove(CONFIG_PATH)
+        os.remove(cfg_path())
     except OSError:
         pass
 
@@ -803,12 +914,12 @@ def logout():
 # ----------------------------- پیام‌های ادمین -----------------------------
 def show_menu(text='یکی از گزینه‌ها رو انتخاب کن:'):
     S.update(mode=None, state='menu')
-    send_message(ADMIN_ID, text, MENU_KB)
+    send_message(UID(), text, MENU_KB)
 
 
 def enter_extract():
     S.update(mode='extract', state='extract')
-    send_message(ADMIN_ID, '🔗 لینک یا @یوزرنیم کانال رو بفرست.\n'
+    send_message(UID(), '🔗 لینک یا @یوزرنیم کانال رو بفرست.\n'
                            '🔒 برای کانال خصوصی: لینک دعوت (https://splus.ir/+...) رو بفرست، یا /channels بزن '
                            'تا لیست کانال‌های اکانت رو ببینی و با شماره انتخاب کنی.\n'
                            '(اکانت وصل‌شده باید مالک/ادمین اون کانال باشه)\nبرگشت به منو: /menu', MENU_KB)
@@ -818,12 +929,12 @@ def enter_add():
     S.update(mode='add', state='users', dest=None)
     n = len(S['users'])
     if n:
-        send_message(ADMIN_ID, f'📋 {n:,} یوزرنیم آماده‌ست (از آخرین استخراج/لیست قبلی).\n\n'
+        send_message(UID(), f'📋 {n:,} یوزرنیم آماده‌ست (از آخرین استخراج/لیست قبلی).\n\n'
                                '🔗 لینک کانال مقصد رو بفرست (https://splus.ir/... یا لینک دعوت خصوصی)\n'
                                'یا /channels بزن تا از بین کانال‌های اکانت با شماره انتخاب کنی.\n'
                                'یوزرنیم‌های بیشتر/لیست جدید هم می‌تونی بفرستی. برای خالی کردن لیست: /cancel', MENU_KB)
     else:
-        send_message(ADMIN_ID, '📋 لیست یوزرنیم‌ها رو به‌صورت متن (@user1 @user2 ...) یا فایل txt بفرست.\n'
+        send_message(UID(), '📋 لیست یوزرنیم‌ها رو به‌صورت متن (@user1 @user2 ...) یا فایل txt بفرست.\n'
                                'می‌تونی چند پیام پشت‌سرهم بفرستی؛ همه جمع می‌شن.\nبرگشت به منو: /menu', MENU_KB)
 
 
@@ -856,33 +967,45 @@ def show_channels():
         un = getattr(e, 'username', None)
         lines.append(f'{i}) {getattr(e, "title", None) or "بدون نام"} — ' + (f'@{un}' if un else '🔒 خصوصی'))
     for part in chunk_lines(lines):
-        send_message(ADMIN_ID, part)
-    send_message(ADMIN_ID, '👆 شماره‌ی کانال مورد نظر رو بفرست. برای لغو: /menu')
+        send_message(UID(), part)
+    send_message(UID(), '👆 شماره‌ی کانال مورد نظر رو بفرست. برای لغو: /menu')
+
+
+def confirm_text():
+    n = len(S['users'])
+    t = S['target'] or ADD_LIMIT
+    return (f'📌 مقصد: {ref_label(S["dest"])}\n👥 یوزرنیم‌های آماده: {n:,}\n'
+            f'🎯 تعداد هدف: {t:,} نفر\n'
+            '(فقط کسایی حساب می‌شن که واقعاً به کانال اضافه بشن؛ اونایی که افزودن رو بسته باشن رد می‌شن '
+            'و بعدی‌ها امتحان می‌شن.)\n\n'
+            f'🔢 برای تغییر تعداد، یه عدد بفرست (حداکثر {ADD_LIMIT:,})\n'
+            'برای شروع بنویس: شروع\nبرای لغو: /cancel')
+
+
+_FA_DIGITS = str.maketrans('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789')
 
 
 def set_dest_and_confirm(chat_id, dest):
     if not S['users']:
         send_message(chat_id, 'اول لیست یوزرنیم‌ها رو بفرست.')
         return
-    S['dest'], S['state'] = dest, 'confirm'
-    n = len(S['users'])
-    send_message(chat_id, f'📌 مقصد: {ref_label(dest)}\n👥 تعداد یوزرنیم: {n:,}\n'
-                          f'این بار حداکثر {min(n, ADD_LIMIT):,} نفر اضافه می‌شه'
-                          + (f' و {n - ADD_LIMIT:,} نفر برای بار بعد می‌مونه' if n > ADD_LIMIT else '')
-                          + '.\n\nبرای شروع بنویس: شروع\nبرای لغو: /cancel')
+    S['dest'], S['state'], S['target'] = dest, 'confirm', ADD_LIMIT
+    send_message(chat_id, confirm_text())
 
 
 def handle_message(m):
-    chat_id = m.get('chat', {}).get('id')
-    if chat_id != ADMIN_ID:
+    chat = m.get('chat', {})
+    chat_id = chat.get('id')
+    if chat_id is None or chat.get('type', 'private') != 'private':
         return
+    bind(chat_id)
     text = (m.get('text') or '').strip()
     contact = m.get('contact')
     doc = m.get('document')
     cmd = text.split()[0].split('@')[0].lower() if text.startswith('/') else ''
 
     if S['waiting'] and text and not cmd:
-        ANSWERS.put(text)
+        S['answers'].put(text)
         if m.get('message_id') is not None:
             delete_message(chat_id, m['message_id'])
         return
@@ -890,6 +1013,11 @@ def handle_message(m):
     if cmd == '/logout':
         logout()
         send_message(chat_id, '🗑 اکانت قطع شد و سشن پاک شد. برای وصل‌شدن دوباره /start بزن.', REMOVE_KB)
+        return
+    if cmd == '/stats' and chat_id == ADMIN_ID:
+        send_message(chat_id, f'👥 کاربران ثبت‌شده: {len(CTXS):,}\n🟢 اکانت وصل: '
+                              f'{sum(1 for c in CTXS.values() if c["running"]):,}\n'
+                              f'⚙️ عملیات در حال انجام: {sum(1 for c in CTXS.values() if c["busy"]):,}')
         return
     if cmd == '/stop':
         S['stop'] = True
@@ -916,6 +1044,8 @@ def handle_message(m):
             show_menu()
         elif S['starting']:
             send_message(chat_id, '⏳ اکانت در حال وصل‌شدنه. اگه کد اومد، با خط‌تیره بفرست.')
+        elif MAX_USERS and connected_count() >= MAX_USERS:
+            send_message(chat_id, '⚠️ ظرفیت بات فعلاً پره. کمی بعد دوباره /start بزن.')
         else:
             S['state'] = 'phone'
             send_message(chat_id, '📱 شماره‌ی اکانتی رو بفرست که مالک/ادمین کانال هست '
@@ -956,7 +1086,7 @@ def handle_message(m):
             show_menu()
         return
     if cmd == '/channels':
-        threading.Thread(target=show_channels, daemon=True).start()
+        spawn(show_channels)
         return
     if S['state'] == 'pick' and text.isdigit():
         idx = int(text) - 1
@@ -964,7 +1094,7 @@ def handle_message(m):
             ref = S['picks'][idx]
             if S['mode'] == 'extract':
                 S['state'] = 'extract'
-                threading.Thread(target=run_extract_job, args=(ref,), daemon=True).start()
+                spawn(run_extract_job, ref)
             else:
                 set_dest_and_confirm(chat_id, ref)
         else:
@@ -979,7 +1109,7 @@ def handle_message(m):
                 send_message(chat_id, '❌ لینک یا یوزرنیم کانال معتبر نیست. مثل https://splus.ir/mychannel، '
                                       '@mychannel یا لینک دعوت خصوصی. یا /channels بزن.')
             else:
-                threading.Thread(target=run_extract_job, args=(name,), daemon=True).start()
+                spawn(run_extract_job, name)
         return
 
     # ---- حالت افزودن ----
@@ -992,12 +1122,22 @@ def handle_message(m):
         return
 
     if text and not cmd:
+        if S['state'] == 'confirm' and text.translate(_FA_DIGITS).strip().isdigit():
+            want = int(text.translate(_FA_DIGITS).strip())
+            if want < 1:
+                send_message(chat_id, '❌ عدد باید حداقل ۱ باشه.')
+                return
+            S['target'] = min(want, ADD_LIMIT)
+            if want > ADD_LIMIT:
+                send_message(chat_id, f'⚠️ سقف هر بار {ADD_LIMIT:,} نفره؛ همون ثبت شد.')
+            send_message(chat_id, confirm_text())
+            return
         dest = parse_dest(text)
         if dest:
             set_dest_and_confirm(chat_id, dest)
             return
         if S['state'] == 'confirm' and text.strip().lower() in ('شروع', 'start', 'go'):
-            threading.Thread(target=run_add_job, args=(S['dest'], list(S['users'])), daemon=True).start()
+            spawn(run_add_job, S['dest'], list(S['users']), S['target'])
             return
         names = parse_usernames(text)
         if names:
@@ -1009,8 +1149,6 @@ def handle_message(m):
 def main():
     if not TOKEN:
         sys.exit('متغیر BOT_TOKEN تنظیم نشده.')
-    if not ADMIN_ID:
-        sys.exit('متغیر ADMIN_ID تنظیم نشده.')
     api_post('deleteWebhook', {'drop_pending_updates': False}, timeout=10)
     api_post('setMyCommands', {'commands': [
         {'command': 'start', 'description': 'شروع / منو'},
@@ -1022,9 +1160,15 @@ def main():
         {'command': 'logout', 'description': 'قطع اکانت'},
         {'command': 'cancel', 'description': 'پاک‌کردن لیست'}]}, timeout=10)
 
-    phone = cfg_load().get('phone')
-    if SPLUS_OK and phone and session_files():
-        start_userbot(phone)
+    migrate_old_files()
+    if SPLUS_OK and os.path.isdir(DATA_DIR):
+        for name in sorted(os.listdir(DATA_DIR)):
+            if not name.lstrip('-').isdigit():
+                continue
+            bind(int(name))
+            phone = cfg_load().get('phone')
+            if phone and session_files():
+                start_userbot(phone)
     print('✅ بات بالا اومد')
 
     offset = None
